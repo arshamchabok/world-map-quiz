@@ -1,0 +1,391 @@
+import os
+import sys
+import json
+import math
+import time
+import threading
+
+GEOJSON_URL = "https://raw.githubusercontent.com/johan/world.geo.json/master/countries.geo.json"
+GEOJSON_FILE = "countries.geo.json"
+
+def _maybe_fetch_geojson(): 
+    if os.path.exists(GEOJSON_FILE):
+        return
+    try:
+        import urllib.request
+        with urllib.request.urlopen(GEOJSON_URL, timeout=15) as r, open(GEOJSON_FILE, "wb") as f:
+            f.write(r.read())
+    except Exception:
+        pass
+
+threading.Thread(target=_maybe_fetch_geojson, daemon=True).start()
+
+import pygame
+
+WIDTH, HEIGHT = 1540, 804
+FPS = 60
+BG_COLOR = (160, 216, 241)  
+LAND_OUTLINE = (0, 0, 0)
+LAND_FILL_DEFAULT = (255, 255, 255)
+LAND_FILL_CORRECT = (0, 0, 0)  
+TEXT_COLOR = (25, 25, 25)
+PANEL_BG = (255, 255, 255)
+PANEL_SHADOW = (0, 0, 0, 80)
+
+SCORE_POS = (WIDTH - 260, 15)
+TIMER_POS = (WIDTH - 260, 55)
+RESET_POS = (20, 15)
+BACK_POS = (20, 55)
+FEEDBACK_TIME = 1.2 
+
+LEADERBOARD_FILE = "leaderboard.json"
+
+def equirect_project(lon, lat, w, h):
+    x = (lon + 180.0) / 360.0 * w
+    y = (90.0 - lat) / 180.0 * h
+    return int(x), int(y)
+
+def point_in_polygon(px, py, poly):
+    inside = False
+    n = len(poly)
+    if n < 3:
+        return False
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        if ((y1 > py) != (y2 > py)):
+            x_intersect = x1 + (py - y1) * (x2 - x1) / (y2 - y1 + 1e-12)
+            if x_intersect > px:
+                inside = not inside
+    return inside
+
+def load_leaderboard():
+    if not os.path.exists(LEADERBOARD_FILE):
+        return []
+    try:
+        with open(LEADERBOARD_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_leaderboard(rows):
+    try:
+        with open(LEADERBOARD_FILE, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def format_hms(seconds):
+    seconds = max(0, int(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}h {m:02d}m {s:02d}s"
+
+class CountryShape:
+    def __init__(self, name):
+        self.name = name
+        self.polygons = []  
+        self.correct = False
+
+    def draw(self, surf):
+        fill = LAND_FILL_CORRECT if self.correct else LAND_FILL_DEFAULT
+        for poly in self.polygons:
+            if len(poly) >= 3:
+                pygame.draw.polygon(surf, fill, poly)
+                pygame.draw.polygon(surf, LAND_OUTLINE, poly, 1)
+
+    def hit_test(self, x, y):
+        for poly in self.polygons:
+            if point_in_polygon(x, y, poly):
+                return True
+        return False
+
+class Game:
+    def __init__(self):
+        pygame.init()
+        pygame.display.set_caption("World Quiz (Pygame)")
+        self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
+        self.clock = pygame.time.Clock()
+ 
+        self.font = pygame.font.SysFont(None, 28)
+        self.font_big = pygame.font.SysFont(None, 40)
+        self.font_small = pygame.font.SysFont(None, 22)
+
+        self.state = "menu" 
+        self.username = ""
+        self.username_active = False
+
+        self.countries = []  
+        self.name_to_country = {}  
+
+        self.score = 0
+        self.start_time = None
+        self.feedback_text = ""
+        self.feedback_until = 0
+        self.selected_country = None
+        self.input_active = False
+        self.guess_text = ""
+
+        self.leaderboard = load_leaderboard()
+
+        self.load_geojson_if_ready()
+
+    def load_geojson_if_ready(self):
+        if not os.path.exists(GEOJSON_FILE):
+            return
+        try:
+            with open(GEOJSON_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+
+        feats = data.get("features", [])
+        self.countries.clear()
+        self.name_to_country.clear()
+
+        for feat in feats:
+            props = feat.get("properties", {})
+            name = props.get("name") or props.get("NAME") or "Unknown"
+            geom = feat.get("geometry", {})
+            gtype = geom.get("type")
+            coords = geom.get("coordinates", [])
+
+            country = CountryShape(name)
+
+            def add_polygon(coord_list):
+                poly = []
+                for lon, lat in coord_list:
+                    x, y = equirect_project(lon, lat, WIDTH, HEIGHT)
+                    poly.append((x, y))
+                if len(poly) >= 3:
+                    country.polygons.append(poly)
+
+            if gtype == "Polygon":
+                if coords:
+                    add_polygon(coords[0])
+            elif gtype == "MultiPolygon":
+                for part in coords:
+                    if part:
+                        add_polygon(part[0])
+
+            if country.polygons:
+                self.countries.append(country)
+                self.name_to_country[name.lower()] = country
+
+    def draw_panel(self, rect):
+        pygame.draw.rect(self.screen, PANEL_BG, rect, border_radius=8)
+        pygame.draw.rect(self.screen, (0, 0, 0), rect, width=1, border_radius=8)
+
+    def draw_text(self, text, pos, font=None, color=TEXT_COLOR):
+        if font is None:
+            font = self.font
+        surf = font.render(text, True, color)
+        self.screen.blit(surf, pos)
+
+    def draw_button(self, rect, label):
+        self.draw_panel(rect)
+        tw = self.font.size(label)[0]
+        self.draw_text(label, (rect.x + (rect.w - tw) // 2, rect.y + 8))
+
+    def button_clicked(self, rect, mx, my):
+        return rect.collidepoint(mx, my)
+
+    def update_menu(self, dt):
+        self.screen.fill(BG_COLOR)
+
+        if not self.countries:
+            msg = "Downloading/Looking for countries.geo.json... (place it next to this script if it doesn't appear)"
+            self.draw_text(msg, (40, HEIGHT - 40), self.font_small)
+
+        title = "World Geography Quiz"
+        tw = self.font_big.size(title)[0]
+        self.draw_text(title, (WIDTH // 2 - tw // 2, 120), self.font_big)
+
+        input_rect = pygame.Rect(WIDTH // 2 - 200, 200, 400, 40)
+        self.draw_panel(input_rect)
+        hint = "Enter username"
+        text_show = self.username if self.username or self.username_active else hint
+        color = (0, 0, 0) if self.username or self.username_active else (120, 120, 120)
+        self.draw_text(text_show, (input_rect.x + 12, input_rect.y + 8), color=color)
+
+        play_rect = pygame.Rect(WIDTH // 2 - 200, 260, 400, 42)
+        self.draw_button(play_rect, "Start - Country Borders")
+
+        lb_rect = pygame.Rect(WIDTH // 2 - 250, 330, 500, 220)
+        self.draw_panel(lb_rect)
+        self.draw_text("Leaderboard (Top 10, full clears)", (lb_rect.x + 10, lb_rect.y + 10))
+        rows = sorted(self.leaderboard, key=lambda r: r["time"])[:10]
+        y = lb_rect.y + 40 
+        if not rows:
+            self.draw_text("No scores yet.", (lb_rect.x + 10, y))
+        else:
+            for i, r in enumerate(rows, 1):
+                self.draw_text(f"{i:2d}. {r['user']} — {format_hms(r['time'])}", (lb_rect.x + 10, y))
+                y += 24
+
+        mx, my = pygame.mouse.get_pos()
+        clicked = pygame.mouse.get_pressed()[0]
+
+        if clicked:
+            if input_rect.collidepoint(mx, my):
+                self.username_active = True
+            else:
+                self.username_active = False
+
+            if self.button_clicked(play_rect, mx, my):
+                if not self.username.strip():
+                    self.feedback("Please enter a username first.")
+                elif not self.countries:
+                    self.feedback("Countries not loaded yet.")
+                else:
+                    self.start_game()
+
+    def handle_menu_event(self, e):
+        if e.type == pygame.KEYDOWN and self.username_active:
+            if e.key == pygame.K_BACKSPACE:
+                self.username = self.username[:-1]
+            elif e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                pass
+            else:
+                ch = e.unicode
+                if ch and len(self.username) < 24 and ch.isprintable():
+                    self.username += ch
+
+    def start_game(self):
+        for c in self.countries:
+            c.correct = False
+        self.score = 0
+        self.selected_country = None
+        self.guess_text = ""
+        self.input_active = False
+        self.state = "play"
+        self.start_time = time.time()
+
+    def update_play(self, dt):
+        self.screen.fill(BG_COLOR)
+
+        for c in self.countries:
+            c.draw(self.screen)
+
+        score_rect = pygame.Rect(SCORE_POS[0], SCORE_POS[1], 240, 30)
+        self.draw_panel(score_rect)
+        self.draw_text(f"Score: {self.score}/{len(self.countries)}", (score_rect.x + 10, score_rect.y + 6))
+
+        timer_rect = pygame.Rect(TIMER_POS[0], TIMER_POS[1], 240, 30)
+        self.draw_panel(timer_rect)
+        t = 0 if self.start_time is None else (time.time() - self.start_time)
+        self.draw_text(f"Time: {format_hms(t)}", (timer_rect.x + 10, timer_rect.y + 6))
+
+        reset_rect = pygame.Rect(RESET_POS[0], RESET_POS[1], 120, 30)
+        back_rect = pygame.Rect(BACK_POS[0], BACK_POS[1], 140, 30)
+        self.draw_button(reset_rect, "Reset")
+        self.draw_button(back_rect, "Back to Menu")
+
+ 
+        if time.time() < self.feedback_until and self.feedback_text:
+            msg = self.feedback_text
+            surf = self.font_big.render(msg, True, (0, 0, 0))
+            panel = pygame.Surface((surf.get_width() + 40, surf.get_height() + 24), pygame.SRCALPHA)
+            pygame.draw.rect(panel, (255, 255, 255, 230), panel.get_rect(), border_radius=10)
+            panel.blit(surf, (20, 12))
+            self.screen.blit(panel, (WIDTH // 2 - panel.get_width() // 2, HEIGHT - 120))
+
+        if self.input_active and self.selected_country is not None:
+            box_w = 520
+            box_h = 100
+            box_rect = pygame.Rect(WIDTH // 2 - box_w // 2, 80, box_w, box_h)
+            self.draw_panel(box_rect)
+            self.draw_text("Which country is this? Type answer and press Enter:", (box_rect.x + 12, box_rect.y + 10))
+
+            field = pygame.Rect(box_rect.x + 12, box_rect.y + 46, box_rect.w - 24, 36)
+            pygame.draw.rect(self.screen, (245, 245, 245), field, border_radius=6)
+            pygame.draw.rect(self.screen, (0, 0, 0), field, width=1, border_radius=6)
+            show = self.guess_text if self.guess_text else ""
+            self.draw_text(show, (field.x + 8, field.y + 8))
+
+        mx, my = pygame.mouse.get_pos()
+        clicked = pygame.mouse.get_pressed()[0]
+        if clicked:
+            if reset_rect.collidepoint(mx, my):
+                self.start_game()
+                return
+            if back_rect.collidepoint(mx, my):
+                self.state = "menu"
+                return
+
+            if not self.input_active:
+                hit = None
+                for c in reversed(self.countries):
+                    if c.hit_test(mx, my):
+                        hit = c
+                        break
+                if hit is not None:
+                    self.selected_country = hit
+                    self.input_active = True
+                    self.guess_text = ""
+
+    def handle_play_event(self, e):
+        if self.input_active and self.selected_country is not None:
+            if e.type == pygame.KEYDOWN:
+                if e.key == pygame.K_BACKSPACE:
+                    self.guess_text = self.guess_text[:-1]
+                elif e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    self.submit_answer()
+                else:
+                    ch = e.unicode
+                    if ch and len(self.guess_text) < 60 and ch.isprintable():
+                        self.guess_text += ch
+
+    def submit_answer(self):
+        guess = (self.guess_text or "").strip().lower()
+        answer = (self.selected_country.name or "").strip().lower()
+
+        if guess == answer:
+            if not self.selected_country.correct:
+                self.selected_country.correct = True
+                self.score += 1
+                self.feedback("Correct")
+                if self.score == len(self.countries):
+                    total_time = int(time.time() - self.start_time) if self.start_time else 0
+                    self.leaderboard.append({"user": self.username or "Guest", "time": total_time})
+                    self.leaderboard.sort(key=lambda r: r["time"])
+                    save_leaderboard(self.leaderboard)
+                    self.feedback(f"🎉 Full clear in {format_hms(total_time)}")
+            else:
+                self.feedback("Already solved")
+        else:
+            self.feedback("Incorrect")
+
+        self.input_active = False
+        self.selected_country = None
+        self.guess_text = ""
+
+    def feedback(self, msg):
+        self.feedback_text = msg
+        self.feedback_until = time.time() + FEEDBACK_TIME
+
+    def run(self):
+        while True:
+            dt = self.clock.tick(FPS) / 1000.0
+            for e in pygame.event.get():
+                if e.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit(0)
+                if self.state == "menu":
+                    self.handle_menu_event(e)
+                elif self.state == "play":
+                    self.handle_play_event(e)
+
+            if not self.countries:
+                self.load_geojson_if_ready()
+
+            if self.state == "menu":
+                self.update_menu(dt)
+            elif self.state == "play":
+                self.update_play(dt)
+
+            pygame.display.flip()
+
+if __name__ == "__main__":
+    Game().run()
