@@ -1,7 +1,8 @@
 An interactive, offline world-country borders quiz built with Python + Pygame. 
 Click a country to open the answer box, type the country’s name, and press Enter. 
 Correct guesses fill the country black. The game tracks your score and time, supports reset and back to menu, and saves top-10 completion times locally.
-Features
+
+Features:
 
 Renders country borders from public GeoJSON.
 
